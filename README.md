@@ -1,5 +1,5 @@
 
-# Data Structures and Algorithms - README
+# Data Structures and Algorithms
 
 ## Introduction
 

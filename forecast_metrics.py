@@ -4,8 +4,8 @@ from scipy.stats import pearsonr, entropy
 
 def jensen_shannon_distance(p, q):
     """
-    p, q: discrete probability distributions (arrays summing to 1).
-    JS distance = sqrt(0.5 * KL(p||m) + 0.5 * KL(q||m)) with m=(p+q)/2.
+    p, q: discrete probability distributions (arrays summing to 1)
+    JS distance = sqrt(0.5 * KL(p||m) + 0.5 * KL(q||m)), where m=(p+q)/2
     """
     p = np.asarray(p)
     q = np.asarray(q)
@@ -13,64 +13,85 @@ def jensen_shannon_distance(p, q):
     js_divergence = 0.5 * entropy(p, m) + 0.5 * entropy(q, m)
     return np.sqrt(js_divergence)
 
-def compute_metrics_by_sku(df_pred, data_anomaly_range=(10, 200), anomaly_std_threshold=3.0):
+def compute_metrics_by_sku_and_actual_month(
+    df_pred,
+    data_anomaly_range=(10, 200),
+    anomaly_std_threshold=3.0
+):
     """
-    Compute forecast metrics on a *per-SKU* basis.
+    Compute forecast metrics for EACH (SKU, Actual_Month).
     
-    Expected columns in df_pred:
+    Grouping Key: (SKU, Actual_Month)
+      -> Within each group, we have multiple "Prediction_Month" rows 
+         (e.g., up to 12 months of forecast horizons).
+    
+    Columns expected in df_pred:
       - SKU
-      - Actual_Month
-      - Actual_Value
-      - Prediction_Month
-      - Prediction_Value
-      - Prediction_Actual
-      (optional) Forecast_Lower
-      (optional) Forecast_Upper
+      - Actual_Month       (e.g., '2025-01' or some date-like string)
+      - Actual_Value       (the known actual for that origin month)
+      - Prediction_Month   (the future month being forecast)
+      - Prediction_Value   (the forecast for that future month)
+      - Prediction_Actual  (the true actual for that future month)
+      (optional) Forecast_Lower, Forecast_Upper for intervals
+    
+    Parameters
+    ----------
+    df_pred : pd.DataFrame
+        The expanded forecast data.
+    data_anomaly_range : tuple
+        (min_val, max_val) outside of which the "Actual_Value" is flagged as anomalous.
+    anomaly_std_threshold : float
+        Residuals beyond +/- threshold * std are flagged as anomalies.
     
     Returns
     -------
     df_pred_aug : pd.DataFrame
-        df_pred with extra columns: 'Residual', 'Anomaly_Flag', 'Data_Anomaly_Flag', 'Within_Interval' (if intervals exist)
-    df_sku_metrics : pd.DataFrame
-        Per-SKU metrics table with columns:
-          [SKU, Bias, Anomaly_Rate, PICP, Tracking_Signal, Direction_Accuracy,
-           Positive_Residual_Count, Negative_Residual_Count, Pearson_Correlation,
-           R_squared, Jensen_Shannon_Distance]
+        The original df_pred plus columns:
+          - Residual
+          - Data_Anomaly_Flag
+          - Anomaly_Flag
+          - Within_Interval (if intervals exist)
+    df_group_metrics : pd.DataFrame
+        A table of metrics, one row per (SKU, Actual_Month), with columns like:
+          [SKU, Actual_Month, Bias, Anomaly_Rate, PICP, Tracking_Signal, 
+           Direction_Accuracy, Pearson_Correlation, R_squared, Jensen_Shannon_Distance, etc.]
     """
-    # Ensure the required columns exist
-    required_cols = ["SKU", "Actual_Value", "Prediction_Value", "Prediction_Actual"]
-    for col in required_cols:
-        if col not in df_pred.columns:
-            raise ValueError(f"Column '{col}' is missing from df_pred.")
+    # 1) Ensure required columns
+    required_cols = ["SKU", "Actual_Month", "Actual_Value", 
+                     "Prediction_Month", "Prediction_Value", "Prediction_Actual"]
+    for c in required_cols:
+        if c not in df_pred.columns:
+            raise ValueError(f"Missing required column '{c}' in df_pred.")
     
-    # 1) Compute Residual
+    # 2) Calculate residual: forecast error for each row
     df_pred["Residual"] = df_pred["Prediction_Value"] - df_pred["Prediction_Actual"]
     
-    # 2) Data Anomaly Flag
-    low_range, high_range = data_anomaly_range
+    # 3) Data anomaly: is the origin's Actual_Value out of a plausible range?
+    (low_val, high_val) = data_anomaly_range
     df_pred["Data_Anomaly_Flag"] = df_pred["Actual_Value"].apply(
-        lambda x: 1 if (x < low_range or x > high_range) else 0
+        lambda x: 1 if (x < low_val or x > high_val) else 0
     )
     
-    # 3) Within Interval for PICP (only if we have Forecast_Lower & Forecast_Upper)
+    # 4) PICP: only possible if Forecast_Lower & Forecast_Upper exist
     if "Forecast_Lower" in df_pred.columns and "Forecast_Upper" in df_pred.columns:
         df_pred["Within_Interval"] = df_pred.apply(
-            lambda row: 1 if (row["Prediction_Actual"] >= row["Forecast_Lower"] and
-                              row["Prediction_Actual"] <= row["Forecast_Upper"]) else 0,
+            lambda r: 1 if (r["Prediction_Actual"] >= r["Forecast_Lower"] and 
+                            r["Prediction_Actual"] <= r["Forecast_Upper"]) else 0,
             axis=1
         )
     else:
-        # No intervals available; set to NaN or 0
-        df_pred["Within_Interval"] = np.nan
+        df_pred["Within_Interval"] = np.nan  # or 0 if you prefer
     
-    # Prepare a list for SKU-level metrics
-    sku_list = df_pred["SKU"].unique()
-    metrics_rows = []
+    # 5) Group by (SKU, Actual_Month)
+    grouped = df_pred.groupby(["SKU", "Actual_Month"])
     
-    for sku in sku_list:
-        sub = df_pred[df_pred["SKU"] == sku].copy()
+    results = []
+    
+    for (sku, origin_month), sub in grouped:
+        # 'sub' is the set of rows for this SKU & this origin month,
+        # each row is a different forecast horizon (Prediction_Month).
         
-        # 4) Residual-based anomaly detection
+        # 5a) Compute residual-based anomaly
         res_std = sub["Residual"].std()
         if pd.isna(res_std) or res_std == 0:
             sub["Anomaly_Flag"] = 0
@@ -78,63 +99,66 @@ def compute_metrics_by_sku(df_pred, data_anomaly_range=(10, 200), anomaly_std_th
             upper_bound = anomaly_std_threshold * res_std
             lower_bound = -anomaly_std_threshold * res_std
             sub["Anomaly_Flag"] = sub["Residual"].apply(
-                lambda x: 1 if x < lower_bound or x > upper_bound else 0
+                lambda x: 1 if (x < lower_bound or x > upper_bound) else 0
             )
         
-        # Assign back to main df_pred
+        # Assign these anomaly flags back
         df_pred.loc[sub.index, "Anomaly_Flag"] = sub["Anomaly_Flag"]
         
-        # --- Compute per-SKU metrics ---
-        bias = sub["Residual"].mean()
-        anomaly_rate = sub["Anomaly_Flag"].mean() if len(sub) > 0 else np.nan
+        # 5b) Basic metrics
+        bias = sub["Residual"].mean()                       # mean error
+        anomaly_rate = sub["Anomaly_Flag"].mean()           # fraction of anomalies
+        picp = sub["Within_Interval"].mean() if sub["Within_Interval"].notna().any() else np.nan
         
-        # PICP
-        if "Within_Interval" in sub.columns and sub["Within_Interval"].notna().any():
-            # If we do have intervals, compute coverage among the non-NaN
-            picp_valid = sub["Within_Interval"].dropna()
-            picp = picp_valid.mean() if len(picp_valid) > 0 else np.nan
-        else:
-            picp = np.nan
-        
-        # Tracking Signal
+        # Tracking Signal = sum(residual) / (MAD * N)
         residual_sum = sub["Residual"].sum()
         mad = sub["Residual"].abs().mean()
-        if mad == 0 or len(sub) == 0:
+        if (mad == 0) or (len(sub) == 0):
             tracking_signal = np.nan
         else:
             tracking_signal = residual_sum / (mad * len(sub))
         
-        # Direction Accuracy (check step_ahead=1 if feasible)
+        # 5c) Direction Accuracy for step=1 only, if your data has monthly steps:
+        #    We'll parse the months as dates and see if Prediction_Month is exactly +1 from Actual_Month
         direction_checks = []
-        # If Actual_Month/Prediction_Month are in numeric or date form, 
-        # adjust logic accordingly. For now, let's do a naive approach:
-        # We'll parse them as dates if they look like "YYYY-MM".
+        
+        # Attempt to convert to datetime; if not possible, fallback to NaN
         try:
-            sub["AM_dt"] = pd.to_datetime(sub["Actual_Month"], format="%Y-%m")
-            sub["PM_dt"] = pd.to_datetime(sub["Prediction_Month"], format="%Y-%m")
+            sub["AM_dt"] = pd.to_datetime(sub["Actual_Month"], format="%Y-%m", errors="coerce")
+            sub["PM_dt"] = pd.to_datetime(sub["Prediction_Month"], format="%Y-%m", errors="coerce")
+            
             for row in sub.itertuples(index=False):
-                # If the predicted month is exactly 1 month after actual
-                if (row.PM_dt.year == row.AM_dt.year and row.PM_dt.month == row.AM_dt.month + 1) \
-                   or (row.PM_dt.year == row.AM_dt.year + 1 and row.PM_dt.month == (row.AM_dt.month - 11)):
-                    actual_change = row.Prediction_Actual - row.Actual_Value
-                    forecast_change = row.Prediction_Value - row.Actual_Value
-                    direction_checks.append(np.sign(actual_change) == np.sign(forecast_change))
-            direction_accuracy = sum(direction_checks)/len(direction_checks) if len(direction_checks)>0 else np.nan
+                # If PM_dt is exactly 1 month after AM_dt
+                if (row.PM_dt is not pd.NaT) and (row.AM_dt is not pd.NaT):
+                    # Compare (year, month) logic
+                    # e.g., if row.AM_dt = 2025-01, row.PM_dt = 2025-02 => step=1
+                    am_year, am_month = row.AM_dt.year, row.AM_dt.month
+                    pm_year, pm_month = row.PM_dt.year, row.PM_dt.month
+                    # naive check:
+                    if (pm_year == am_year and pm_month == am_month + 1) or \
+                       (pm_year == am_year + 1 and (am_month == 12 and pm_month == 1)):
+                        # direction
+                        actual_change = row.Prediction_Actual - row.Actual_Value
+                        forecast_change = row.Prediction_Value - row.Actual_Value
+                        direction_checks.append(np.sign(actual_change) == np.sign(forecast_change))
         except:
-            # If there's any date-parsing issue, fallback:
-            direction_accuracy = np.nan
+            pass
         
-        # Residual counts
-        positive_residual_count = (sub["Residual"] > 0).sum()
-        negative_residual_count = (sub["Residual"] < 0).sum()
+        direction_accuracy = None
+        if len(direction_checks) > 0:
+            direction_accuracy = sum(direction_checks) / len(direction_checks)
         
-        # Pearson correlation
+        # 5d) Residual counts
+        positive_res_count = (sub["Residual"] > 0).sum()
+        negative_res_count = (sub["Residual"] < 0).sum()
+        
+        # 5e) Pearson correlation
         if len(sub) > 1:
             pearson_corr, _ = pearsonr(sub["Prediction_Value"], sub["Prediction_Actual"])
         else:
             pearson_corr = np.nan
         
-        # R-squared
+        # 5f) R-squared
         y_true = sub["Prediction_Actual"]
         y_pred = sub["Prediction_Value"]
         ss_res = np.sum((y_true - y_pred)**2)
@@ -144,14 +168,14 @@ def compute_metrics_by_sku(df_pred, data_anomaly_range=(10, 200), anomaly_std_th
         else:
             r_squared = 1 - (ss_res / ss_tot)
         
-        # Jensen-Shannon Distance
+        # 5g) Jensen-Shannon Distance between distributions of predicted vs actual
         if len(sub) > 1:
-            val_min = min(y_true.min(), y_pred.min())
-            val_max = max(y_true.max(), y_pred.max())
-            if val_min == val_max:
+            all_min = min(y_true.min(), y_pred.min())
+            all_max = max(y_true.max(), y_pred.max())
+            if all_min == all_max:
                 js_dist = 0.0
             else:
-                bins = np.linspace(val_min, val_max, 10)
+                bins = np.linspace(all_min, all_max, 10)
                 true_hist, _ = np.histogram(y_true, bins=bins)
                 pred_hist, _ = np.histogram(y_pred, bins=bins)
                 if true_hist.sum() == 0 or pred_hist.sum() == 0:
@@ -163,71 +187,60 @@ def compute_metrics_by_sku(df_pred, data_anomaly_range=(10, 200), anomaly_std_th
         else:
             js_dist = np.nan
         
-        metrics_rows.append({
+        results.append({
             "SKU": sku,
+            "Actual_Month": origin_month,
             "Bias": bias,
             "Anomaly_Rate": anomaly_rate,
             "PICP": picp,
             "Tracking_Signal": tracking_signal,
             "Direction_Accuracy": direction_accuracy,
-            "Positive_Residual_Count": positive_residual_count,
-            "Negative_Residual_Count": negative_residual_count,
+            "Positive_Residual_Count": positive_res_count,
+            "Negative_Residual_Count": negative_res_count,
             "Pearson_Correlation": pearson_corr,
             "R_squared": r_squared,
             "Jensen_Shannon_Distance": js_dist
         })
     
-    df_sku_metrics = pd.DataFrame(metrics_rows)
-    return df_pred, df_sku_metrics
+    df_group_metrics = pd.DataFrame(results)
+    return df_pred, df_group_metrics
 
 
+# ---------------------------
+# USAGE EXAMPLE (demo):
+# ---------------------------
 if __name__ == "__main__":
-    # 1) Read the CSV file (adjust filename/path as needed)
-    csv_file = "sample_data_generated.csv"
-    df_pred_input = pd.read_csv(csv_file)
+    # Suppose you have a CSV called "sample_data_generated.csv" 
+    # with columns [SKU, Actual_Month, Actual_Value, Prediction_Month, Prediction_Value, Prediction_Actual, ...]
     
-    # 2) Compute the metrics
-    # If you want to define a specific anomaly range or threshold, do so here:
-    df_pred_aug, df_sku_metrics = compute_metrics_by_sku(
-        df_pred_input,
-        data_anomaly_range=(10, 200),
-        anomaly_std_threshold=3.0
-    )
-    
-    # 3) Print the per-SKU metrics
-    print("\n=== PER-SKU METRICS ===")
-    print(df_sku_metrics)
-    
-    # 4) Show a sample of the augmented DataFrame with anomalies
-    print("\n=== SAMPLE OF AUGMENTED DATA ===")
-    print(df_pred_aug.head(10))
-    
-    # 5) Example: Check threshold-based "red flags" for each SKU
-    print("\n=== RED FLAGS (Per SKU) ===")
-    red_flags = {}
-    for _, row in df_sku_metrics.iterrows():
-        sku = row["SKU"]
-        sku_flags = []
+    # For demonstration, let's build a small example DataFrame by hand:
+    data = [
+        ["SKU_1", "2025-01", 120, "2025-02", 115, 110],
+        ["SKU_1", "2025-01", 120, "2025-03", 118, 125],
+        ["SKU_1", "2025-01", 120, "2025-04", 130, 128],
+        ["SKU_1", "2025-02", 110, "2025-03", 112, 125],
+        ["SKU_1", "2025-02", 110, "2025-04", 108, 128],
         
-        if abs(row["Bias"]) > 5:
-            sku_flags.append(f"High Bias: {row['Bias']:.2f}")
-        if row["Anomaly_Rate"] > 0.05:
-            sku_flags.append(f"Anomaly Rate > 5%: {row['Anomaly_Rate']:.2%}")
-        if abs(row["Tracking_Signal"]) > 4:
-            sku_flags.append(f"Tracking Signal out of +/-4: {row['Tracking_Signal']:.2f}")
-        if (row["Direction_Accuracy"] is not None and 
-            row["Direction_Accuracy"] < 0.6):
-            sku_flags.append(f"Direction Accuracy < 60%: {row['Direction_Accuracy']:.2%}")
-        if (row["PICP"] is not None and row["PICP"] < 0.7):
-            sku_flags.append(f"PICP < 70%: {row['PICP']:.2%}")
-        
-        if sku_flags:
-            red_flags[sku] = sku_flags
+        ["SKU_2", "2025-01", 80,  "2025-02", 85,  78],
+        ["SKU_2", "2025-01", 80,  "2025-03", 95,  88],
+        ["SKU_2", "2025-01", 80,  "2025-04", 100, 102],
+        # etc...
+    ]
+    df_demo = pd.DataFrame(data, columns=[
+        "SKU", "Actual_Month", "Actual_Value", 
+        "Prediction_Month", "Prediction_Value", "Prediction_Actual"
+    ])
     
-    if not red_flags:
-        print("No red flags triggered.")
-    else:
-        for sku, flags in red_flags.items():
-            print(f"\nSKU: {sku}")
-            for f in flags:
-                print(" -", f)
+    # (Optional) add intervals if you have them
+    # df_demo["Forecast_Lower"] = df_demo["Prediction_Value"] - 5
+    # df_demo["Forecast_Upper"] = df_demo["Prediction_Value"] + 5
+    
+    # Now compute metrics per (SKU, Actual_Month)
+    df_aug, df_grouped_metrics = compute_metrics_by_sku_and_actual_month(df_demo)
+    
+    # Print results
+    print("\n=== AUGMENTED DF (first few rows) ===")
+    print(df_aug.head(10))
+    
+    print("\n=== METRICS PER (SKU, Actual_Month) ===")
+    print(df_grouped_metrics)

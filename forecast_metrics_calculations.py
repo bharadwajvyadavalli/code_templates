@@ -1,155 +1,192 @@
-def compute_bias(actuals: pd.Series, preds: pd.Series) -> float:
-    """
-    Mean forecast error: mean(pred - actual).
-    """
-    residual = preds - actuals
-    return residual.mean()
+import numpy as np
+import pandas as pd
+from scipy.stats import pearsonr, norm
+from scipy.stats import entropy
+from scipy.spatial.distance import jensenshannon
 
 
-def compute_r_squared(actuals: pd.Series, preds: pd.Series) -> float:
+def generate_integer_forecast_data(n_months=24, horizon=12,
+                                   low=30, high=50, max_offset=5, seed=42):
     """
-    R^2 = 1 - (SS_res / SS_tot), 
-    where:
-      SS_res = sum((actual - pred)^2),
-      SS_tot = sum((actual - mean(actual))^2).
+    Generate synthetic univariate forecast data:
+      - actuals: integers in [low, high], length n_months
+      - preds: for each t, horizon-months-ahead forecast = actual[t+h] ± offset
+    Returns:
+      actuals, preds as 1D numpy arrays of equal length
     """
-    residual = preds - actuals
-    ss_res = (residual ** 2).sum()
-    ss_tot = ((actuals - actuals.mean()) ** 2).sum()
-    if ss_tot == 0:
-        return np.nan
-    return 1 - (ss_res / ss_tot)
+    np.random.seed(seed)
+    series = np.random.randint(low, high+1, size=n_months)
+    actuals, preds = [], []
+    for i in range(n_months):
+        for h in range(1, horizon+1):
+            if i + h < n_months:
+                actuals.append(series[i + h])
+                preds.append(series[i + h] + np.random.randint(-max_offset, max_offset+1))
+    return np.array(actuals), np.array(preds)
 
+# 1. Systematic Bias
 
-def compute_pearson_corr(actuals: pd.Series, preds: pd.Series) -> float:
-    """
-    Pearson correlation using Pandas' built-in .corr() method on Series.
-    """
-    return actuals.corr(preds)
+def compute_mfe(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Mean Forecast Error: mean(preds - actuals)."""
+    return (preds - actuals).mean()
 
+def compute_mpe(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Mean Percentage Error: mean((preds - actuals)/actuals)*100."""
+    return np.mean((preds - actuals) / actuals) * 100
 
-def compute_residual_counts(actuals: pd.Series, preds: pd.Series) -> tuple:
-    """
-    Returns (count_of_positive_residuals, count_of_negative_residuals).
-    Residual = pred - actual.
-    """
-    residual = preds - actuals
-    pos_count = (residual > 0).sum()
-    neg_count = (residual < 0).sum()
-    return pos_count, neg_count
+def compute_mape(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Mean Absolute Percentage Error: mean(abs(preds - actuals)/actuals)*100."""
+    return np.mean(np.abs((preds - actuals) / actuals)) * 100
 
+def compute_smape(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Symmetric MAPE: mean(2*abs(preds - actuals)/(abs(actuals)+abs(preds)))*100."""
+    return np.mean(2 * np.abs(preds - actuals) / (np.abs(actuals) + np.abs(preds))) * 100
 
-def compute_data_anomalies_shehd(actuals: pd.Series, preds: pd.Series) -> float:
-    """
-    Fraction of 'actuals' beyond mean ± 3*std (SHEHD style).
-    """
-    mean_a = actuals.mean()
-    std_a = actuals.std()
-    if pd.isna(std_a) or std_a == 0:
-        return 0.0
-    lower = mean_a - 3 * std_a
-    upper = mean_a + 3 * std_a
-    mask = (actuals < lower) | (actuals > upper)
-    return mask.mean()  # fraction flagged
+def compute_cumulative_bias(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Cumulative bias: sum(preds - actuals)."""
+    return (preds - actuals).sum()
 
+# 2. Outlier & Anomaly Behavior
 
-def compute_anomalies_shehd(actuals: pd.Series, preds: pd.Series) -> float:
-    """
-    Fraction of residuals beyond ±3*std(residual).
-    """
-    residual = preds - actuals
-    std_r = residual.std()
-    if pd.isna(std_r) or std_r == 0:
-        return 0.0
-    mask = residual.abs() > 3 * std_r
-    return mask.mean()
+def compute_data_anomaly_rate(actuals: np.ndarray, k: float = 3.0) -> float:
+    """Fraction of actuals where |value - median|/MAD > k."""
+    med = np.median(actuals)
+    mad = np.median(np.abs(actuals - med)) or 1.0
+    return np.mean(np.abs(actuals - med) / mad > k)
 
+def compute_residual_anomaly_rate(actuals: np.ndarray, preds: np.ndarray, k: float = 3.0) -> float:
+    """Fraction of residuals where |(pred-actual - mean)|/std > k."""
+    resid = preds - actuals
+    return np.mean(np.abs(resid - resid.mean()) / (resid.std() or 1.0) > k)
 
-def compute_tracking_signal(actuals: pd.Series, preds: pd.Series) -> float:
-    """
-    Tracking Signal = (Sum of residuals) / (MAD * N).
-      residual = (pred - actual),
-      MAD = mean(abs(residual)).
-    """
-    residual = preds - actuals
-    sum_res = residual.sum()
-    mad = residual.abs().mean()
-    n = len(residual)
-    if n == 0 or mad == 0:
-        return np.nan
-    return sum_res / (mad * n)
+def compute_mean_anomaly_magnitude(actuals: np.ndarray, preds: np.ndarray, k: float = 3.0) -> float:
+    """Average magnitude of flagged residual anomalies."""
+    resid = preds - actuals
+    z = np.abs(resid - resid.mean()) / (resid.std() or 1.0)
+    return np.mean(np.abs(resid)[z > k])
 
+def compute_time_to_detect(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Average index of first non-zero residual across series."""
+    flags = (preds - actuals) != 0
+    idx = np.where(flags)[0]
+    return idx.mean() if idx.size else np.nan
 
-def compute_picp(actuals: pd.Series, preds: pd.Series) -> float:
-    """
-    Naive PICP with no explicit intervals:
-      We'll pretend the forecast has ±10% intervals around preds,
-      and see what fraction of actuals fall within [0.9*pred, 1.1*pred].
-    """
-    lower = preds * 0.9
-    upper = preds * 1.1
-    in_interval = (actuals >= lower) & (actuals <= upper)
-    return in_interval.mean()
+def compute_persistence(actuals: np.ndarray, preds: np.ndarray) -> int:
+    """Longest run of consecutive non-zero residuals."""
+    flags = (preds - actuals) != 0
+    run = max_run = 0
+    for f in flags:
+        run = run + 1 if f else 0
+        max_run = max(max_run, run)
+    return max_run
 
+# 3. Direction & Velocity Dynamics
 
-def compute_ause(actuals: pd.Series, preds: pd.Series) -> float:
-    """
-    Average Unsigned Scaled Error:
-      AUSE = mean(|pred - actual| / (|actual| + epsilon))
-    """
-    epsilon = 1e-9
-    ae = (preds - actuals).abs()
-    scale = actuals.abs() + epsilon
-    return (ae / scale).mean()
+def compute_direction_accuracy(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Fraction of correct up/down movements."""
+    return np.mean(np.sign(np.diff(actuals, prepend=actuals[0])) ==
+                   np.sign(np.diff(preds, prepend=preds[0])))
 
+def compute_velocity_error(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """MAE of first differences."""
+    return np.mean(np.abs(np.diff(preds) - np.diff(actuals)))
 
-def compute_directional_accuracy(actuals: pd.Series, preds: pd.Series) -> float:
-    """
-    Fraction of times consecutive changes match in direction:
-      sign(actual[i] - actual[i-1]) == sign(pred[i] - pred[i-1])
-    Skips the first point, so requires at least 2 data points.
-    """
-    if len(actuals) < 2:
-        return np.nan
-    actual_diff = actuals.diff()  # change from row to row
-    pred_diff = preds.diff()
-    
-    direction_mask = np.sign(actual_diff) == np.sign(pred_diff)
-    # The first element of direction_mask is NaN (since diff(0) is NaN)
-    # so skip it:
-    return direction_mask.iloc[1:].mean()
+def compute_acceleration_error(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """MAE of second differences."""
+    return np.mean(np.abs(np.diff(preds, n=2) - np.diff(actuals, n=2)))
 
+def compute_turning_point_f1(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """F1 score on local peaks/valleys."""
+    da = np.sign(np.diff(actuals)); dp = np.sign(np.diff(preds))
+    tp_a = np.concatenate(([False], da[1:] != da[:-1], [False]))
+    tp_p = np.concatenate(([False], dp[1:] != dp[:-1], [False]))
+    true = set(np.where(tp_a)[0]); pred = set(np.where(tp_p)[0])
+    inter = true & pred
+    prec = len(inter)/len(pred) if pred else np.nan
+    rec = len(inter)/len(true) if true else np.nan
+    return 2 * prec * rec / (prec + rec) if prec and rec else np.nan
 
-def compute_data_drift_jsd(actuals: pd.Series, preds: pd.Series, bins=10) -> float:
-    """
-    Jensen-Shannon Distance between distributions of actuals and preds,
-    using histogram-based approach with pd.cut().
-    """
-    if len(actuals) == 0 or len(preds) == 0:
-        return np.nan
-    
-    min_val = min(actuals.min(), preds.min())
-    max_val = max(actuals.max(), preds.max())
-    if min_val == max_val:
-        return 0.0  # all data is identical
-    
-    cats_a = pd.cut(actuals, bins=bins, include_lowest=True, labels=False)
-    cats_p = pd.cut(preds, bins=bins, include_lowest=True, labels=False)
-    
-    counts_a = cats_a.value_counts().sort_index()
-    counts_p = cats_p.value_counts().sort_index()
-    
-    if counts_a.sum() == 0 or counts_p.sum() == 0:
-        return np.nan
-    
-    p = counts_a / counts_a.sum()
-    q = counts_p / counts_p.sum()
-    m = 0.5 * (p + q)
-    
-    p_arr = p.to_numpy()
-    q_arr = q.to_numpy()
-    m_arr = m.to_numpy()
-    
-    # Jensen-Shannon divergence
-    js_divergence = 0.5 * entropy(p_arr, m_arr) + 0.5 * entropy(q_arr, m_arr)
-    return np.sqrt(js_divergence)
+def compute_trend_change_delay(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Avg lag between true and predicted trend reversals."""
+    da = np.sign(np.diff(actuals)); dp = np.sign(np.diff(preds))
+    tp_a = np.where(np.concatenate(([0], da[1:] != da[:-1], [0])))[0]
+    tp_p = np.where(np.concatenate(([0], dp[1:] != dp[:-1], [0])))[0]
+    delays = [next((t - ta for t in tp_p if t >= ta), np.nan) for ta in tp_a]
+    return np.nanmean(delays) if delays else np.nan
+
+# 4. Probabilistic Calibration & Sharpness
+
+def compute_picp(actuals: np.ndarray, preds: np.ndarray, z: float = 1.96) -> float:
+    """Coverage percent within ±z*std residual interval."""
+    resid = preds - actuals; half = z * resid.std()
+    return np.mean((actuals >= preds-half) & (actuals <= preds+half)) * 100
+
+def compute_interval_width(actuals: np.ndarray, preds: np.ndarray, z: float = 1.96) -> float:
+    """Avg width of ±z*std intervals."""
+    return 2 * z * (preds - actuals).std()
+
+def compute_interval_score(actuals: np.ndarray, preds: np.ndarray, alpha: float = 0.1) -> float:
+    """Winkler-style interval score."""
+    resid = preds - actuals; std = resid.std()
+    half = norm.ppf(1-alpha/2) * std
+    lower, upper = preds-half, preds+half
+    miss_low = np.where(actuals < lower, lower - actuals, 0)
+    miss_high = np.where(actuals > upper, actuals - upper, 0)
+    return np.mean((upper-lower) + (2/alpha)*miss_low + (2/alpha)*miss_high)
+
+def compute_winkler_score(actuals: np.ndarray, preds: np.ndarray, alpha: float = 0.1) -> float:
+    return compute_interval_score(actuals, preds, alpha)
+
+def compute_crps(actuals: np.ndarray, preds: np.ndarray) -> float:
+    """Continuous Ranked Probability Score."""
+    std = (preds - actuals).std()
+    z = (actuals - preds) / std
+    return np.mean(std * (z * (2*norm.cdf(z)-1) + 2*norm.pdf(z) - 1/np.sqrt(np.pi)))
+
+# 5. Distributional Drift & Stability
+
+def compute_sliding_jsd(actuals: np.ndarray, preds: np.ndarray, w: int = 6) -> float:
+    """Mean JSD over sliding windows."""
+    jsd_vals = []
+    for i in range(len(actuals)-w+1):
+        ha, _ = np.histogram(actuals[i:i+w], bins=10, density=True)
+        hp, _ = np.histogram(preds[i:i+w], bins=10, density=True)
+        jsd_vals.append(jensenshannon(ha, hp))
+    return np.mean(jsd_vals)
+
+def compute_psi(actuals: np.ndarray, preds: np.ndarray, bins: int = 10) -> float:
+    """Population Stability Index."""
+    ha, edges = np.histogram(actuals, bins=bins, density=True)
+    hp, _     = np.histogram(preds,    bins=edges, density=True)
+    ha += 1e-6; hp += 1e-6
+    return np.sum((ha-hp) * np.log(ha/hp))
+
+def compute_kl_divergence(actuals: np.ndarray, preds: np.ndarray, bins: int = 10) -> float:
+    """KL divergence between distributions."""
+    ha, edges = np.histogram(actuals, bins=bins, density=True)
+    hp, _     = np.histogram(preds,    bins=edges, density=True)
+    ha += 1e-6; hp += 1e-6
+    return np.sum(ha * np.log(ha/hp))
+
+def compute_rolling_error_variance(actuals: np.ndarray, preds: np.ndarray, w: int = 6) -> float:
+    return pd.Series(preds-actuals).rolling(w).var().dropna().mean()
+
+def compute_mmd(actuals: np.ndarray, preds: np.ndarray, sigma: float = 1.0) -> float:
+    """Maximum Mean Discrepancy with RBF kernel."""
+    X, Y = actuals, preds
+    xx = np.exp(-np.subtract.outer(X, X)**2/(2\sigma**2)).mean()
+    yy = np.exp(-np.subtract.outer(Y, Y)**2/(2\sigma**2)).mean()
+    xy = np.exp(-np.subtract.outer(X, Y)**2/(2\sigma**2)).mean()
+    return xx + yy - 2*xy
+
+# 6. Model Robustness & Change‑Sensitivity (placeholders)
+def compute_feature_drift_rate(actuals: np.ndarray, preds: np.ndarray) -> float:
+    return compute_psi(actuals, preds)
+def compute_parameter_sensitivity_index(*args, **kwargs) -> float:
+    raise NotImplementedError
+def compute_retraining_gain(*args, **kwargs) -> float:
+    raise NotImplementedError
+def compute_forecast_variability_index(*args, **kwargs) -> float:
+    raise NotImplementedError
+def compute_out_of_sample_gap(*args, **kwargs) -> float:
+    raise NotImplementedError

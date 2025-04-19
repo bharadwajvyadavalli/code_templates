@@ -86,7 +86,7 @@ def generate_baseline_data_ym(num_skus=10, n_months=24, start_ym="2025-01", seed
 def inject_anomalies_and_bias(
         df_pred,
         data_anomaly_prob=0.05,
-        data_anomaly_factor=5.0,
+        data_anomaly_factor=2.0,
         residual_anomaly_prob=0.05,
         residual_anomaly_factor=30.0,
         bias_sku_list=("SKU_1", "SKU_2"),
